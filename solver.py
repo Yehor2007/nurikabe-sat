@@ -1,16 +1,28 @@
 import sys
 import os
 import subprocess
+import argparse
 
-def solve_nurikabe(filename):
-    # check if the instance file exists before proceeding
-    if not os.path.exists(filename):
-        print(f"Error: File {filename} not found.")
-        return
+def parse_arguments():
+    # define command line arguments
+    parser = argparse.ArgumentParser(description="Nurikabe (1 & 2) SAT Solver")
+    parser.add_argument("-i", "--input", required=True, help="Path to the instance file")
+    parser.add_argument("-o", "--output", default="task.cnf", help="Path to save the generated DIMACS CNF formula")
+    parser.add_argument("-s", "--solver", default="./glucose", help="Path to the SAT solver executable")
+    parser.add_argument("--stats", action="store_true", help="Output statistics from the SAT solver")
+    return parser.parse_args()
+
+def solve_nurikabe():
+    args = parse_arguments()
     
-    # load and sanitize the input grid
-    # we need to handle potential whitespace or formatting issues from different text editors
-    with open(filename, 'r') as f:
+    # check if the input file exists
+    if not os.path.exists(args.input):
+        print(f"Error: File {args.input} not found.")
+        return
+
+    # read the input file
+    # we also handle potential whitespace issues to be safe
+    with open(args.input, 'r') as f:
         raw_lines = f.readlines()
 
     grid = []
@@ -21,21 +33,21 @@ def solve_nurikabe(filename):
 
     rows = len(grid)
     cols = len(grid[0])
-
-    # Variable Mapping:
-    # Each cell (r, c) is mapped to a unique integer ID > 0.
-    # Semantics: True = black cell (Ocean), False = white cell (Island).
+    
+    # map variables to grid positions
+    # variables are numbered from 1
+    # True means black cell (Ocean), False means white cell (Island)
     def var_idx(r, c):
         return r * cols + c + 1
 
     clauses = []
     
-    # Iterate over the grid to generate local constraints
+    # iterate over the grid and generate constraints
     for r in range(rows):
         for c in range(cols):
             v = var_idx(r, c)
-
-            # identify valid orthogonal neighbors
+            
+            # get valid neighbors
             nbs = []
             for nr, nc in [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]:
                 if 0 <= nr < rows and 0 <= nc < cols:
@@ -43,116 +55,122 @@ def solve_nurikabe(filename):
 
             cell = grid[r][c]
 
-            # Constraint 1: Hint '1'
-            # If a cell contains '1', it is an island of size 1.
-            # Logic: The cell itself must be white (false), and all neighbors must be black (true).
+            # constraints for '1'
+            # if a cell is 1, it must be white, and neighbors must be black
             if cell == '1':
-                clauses.append([-v]) # Force self to white
-                for n in nbs:
-                    clauses.append([n]) # Force neighbors to black
-
-            # Constraint 2: Hint '2'
-            # If a cell contains '2', it is an island of size 2.
-            # Logic: The cell is white. Exactly one neighbor is white.
+                clauses.append([-v]) 
+                for n in nbs: 
+                    clauses.append([n])
+            
+            # constraints for '2'
+            # if a cell is 2, it is white and connects to exactly one white neighbor
             elif cell == '2':
-                clauses.append([-v]) # Force self to white
+                clauses.append([-v])
+                
+                # at least one neighbor is white
+                clauses.append([-n for n in nbs]) 
 
-                # Rule: At least one neighbor must be white (not all can be black)
-                # CNF: (-n1 v -n2 v ...)
-                clauses.append([-n for n in nbs])
-
-                # Rule: At most one neighbor can be White (pairwise exclusion)
-                # This ensures we don't form a 'T' shape or larger blob.
+                # at most one neighbor is white
+                # this prevents the island from branching
                 for i in range(len(nbs)):
                     for j in range(i + 1, len(nbs)):
                         clauses.append([nbs[i], nbs[j]])
-
-
-                # Rule: The chosen white neighbor cannot extend the island further.
-                # Its neighbors (except the original '2') must be Black.
+                
+                # the white neighbor cannot have other white neighbors
+                # this ensures the island size is exactly 2
                 for nr, nc in [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]:
                     if 0 <= nr < rows and 0 <= nc < cols:
                         n_var = var_idx(nr, nc)
-
-                        # look at the neighbors of this neighbor
+                        
+                        # check neighbors of the neighbor
                         nn_list = []
                         for nnr, nnc in [(nr-1, nc), (nr+1, nc), (nr, nc-1), (nr, nc+1)]:
                             if 0 <= nnr < rows and 0 <= nnc < cols:
                                 nn_list.append(var_idx(nnr, nnc))
-
-                        # Implication: If n_var is white -> its neighbors (nn) must be black        
+                        
+                        # if n_var is white, its neighbors must be black
                         for nn in nn_list:
-                            if nn != v:
+                            if nn != v: # except the original cell
                                 clauses.append([n_var, nn])
 
-            # Constraint 3: Empty Cells
-            # Optimization: In the "1 & 2" variant, an island can only start at a number.
-            # If an empty cell is not adjacent to a '2', it cannot possibly be white
-            # because '1's are isolated and '2's can only extend one step.
+            # constraints for empty cells
+            # optimization: in this variant, islands only start at numbers
+            # so if an empty cell is not next to a 2, it must be black
             elif cell == '.':
                 is_near_2 = False
                 for nr, nc in [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]:
                     if 0 <= nr < rows and 0 <= nc < cols:
                         if grid[nr][nc] == '2':
                             is_near_2 = True
-
-                # If not near a 2, force it to be Ocean (black) to reduce search space            
+                
                 if not is_near_2:
                     clauses.append([v])
 
-    # Constraint 4: The Ocean Rule
-    # No 2x2 block of cells can be entirely black (True).
-    # CNF: (-A v -B v -C v -D) for every 2x2 square.
+    # ocean rule
+    # no 2x2 block of cells can be entirely black
     for r in range(rows - 1):
         for c in range(cols - 1):
             v1, v2 = var_idx(r, c), var_idx(r+1, c)
             v3, v4 = var_idx(r, c+1), var_idx(r+1, c+1)
             clauses.append([-v1, -v2, -v3, -v4])
 
-
-    cnf_file = "task.cnf"
-    res_file = "solution.txt"
-    
-    with open(cnf_file, 'w') as f:
+    # write the formula in DIMACS format
+    with open(args.output, 'w') as f:
         f.write(f"p cnf {rows * cols} {len(clauses)}\n")
         for c in clauses:
             f.write(" ".join(map(str, c)) + " 0\n")
 
-    if not os.path.exists("./glucose"):
-        print("Error: glucose binary not found.")
+    # call the solver
+    if not os.path.exists(args.solver):
+        print(f"Error: Solver executable '{args.solver}' not found.")
         return
 
-    subprocess.call(["./glucose", cnf_file, res_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # use a temp file for output
+    res_file = "solver_output.tmp"
+    
+    # run glucose
+    cmd = [args.solver, args.output, res_file]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    # print statistics if requested
+    if args.stats:
+        print("--- SOLVER STATISTICS ---")
+        for line in result.stdout.splitlines():
+            if line.startswith("c"):
+                print(line)
+        print("-------------------------")
 
-    # Decode Result
+    # check if output was generated
     if not os.path.exists(res_file):
-        print("Error: Solver output not found.")
+        print("Error: Solver produced no output file.")
         return
 
     with open(res_file, 'r') as f:
         content = f.read()
+    
+    # clean up
+    if os.path.exists(res_file):
+        os.remove(res_file)
 
+    if "UNSAT" in content:
+        print("UNSATISFIABLE")
+        return
+
+    # parse the model
     model = set()
-    tokens = content.replace('v', '').split()
-    
-    if not tokens and "UNSAT" in content:
-        print("UNSATISFIABLE")
-        return
-
-    try:
-        for t in tokens:
+    tokens = content.replace('v', ' ').split()
+    for t in tokens:
+        try:
             val = int(t)
-            if val > 0:
-                model.add(val)
-    except ValueError:
-        pass
-    
-    if len(model) == 0 and "UNSAT" in content:
+            if val > 0: model.add(val)
+        except ValueError: pass
+
+    if not model and "UNSAT" in content:
         print("UNSATISFIABLE")
         return
 
-    # Visualizing the solution
-    print(f"Solution for {filename}:")
+    # print the result in a readable format
+    print(f"Solution for {args.input}:")
     for r in range(rows):
         s = ""
         for c in range(cols):
@@ -164,7 +182,4 @@ def solve_nurikabe(filename):
         print(s)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 solver.py <file>")
-    else:
-        solve_nurikabe(sys.argv[1])
+    solve_nurikabe()
